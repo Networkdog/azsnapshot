@@ -1,0 +1,12 @@
+# Generated snapshots contain a full, sensitive map of your Azure estate + Entra ID.
+# Never commit them.
+*.zip
+azsnapshot-*/
+.azsnapshot-work/
+**/.azsnapshot-work/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
