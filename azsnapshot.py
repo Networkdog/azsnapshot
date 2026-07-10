@@ -101,38 +101,71 @@ BLOB_SINGLE_PUT_MAX = 128 * 1024 * 1024   # single Put Blob threshold
 # --------------------------------------------------------------------------------------
 # Azure Resource Graph KQL catalog (embedded; override with --queries-dir).
 # Each entry becomes one <category>.ndjson file. Non-existent tables are skipped gracefully.
+# Verified against the Microsoft Learn "Supported tables" reference. Governance tables are
+# queried WHOLE (not filtered by subtype) so nothing is missed; downstream filters by `type`.
 # --------------------------------------------------------------------------------------
 KQL_CATALOG = {
+    # Hierarchy + all resources ('resources' is special: also builds the Stage-2 worklist).
     "resourcecontainers": "resourcecontainers",
-    # 'resources' is handled specially (also builds the Stage-2 worklist).
     "resources": "resources",
-    "roleassignments": "authorizationresources | where type =~ 'microsoft.authorization/roleassignments'",
-    "roledefinitions": "authorizationresources | where type =~ 'microsoft.authorization/roledefinitions'",
-    "classicadministrators": "authorizationresources | where type =~ 'microsoft.authorization/classicadministrators'",
-    "denyassignments": "authorizationresources | where type =~ 'microsoft.authorization/denyassignments'",
-    "policyassignments": "policyresources | where type =~ 'microsoft.authorization/policyassignments'",
-    "policydefinitions": "policyresources | where type =~ 'microsoft.authorization/policydefinitions'",
-    "policysetdefinitions": "policyresources | where type =~ 'microsoft.authorization/policysetdefinitions'",
-    "policyexemptions": "policyresources | where type =~ 'microsoft.authorization/policyexemptions'",
+    # Governance / identity / policy / security (whole tables = every subtype captured:
+    # role assignments/definitions/classic admins/deny assignments; policy assignments/
+    # definitions/set definitions/exemptions/metadata/enrollments/versions; Defender posture).
+    "authorizationresources": "authorizationresources",
+    "policyresources": ("policyresources | where type !in~ "
+                        "('microsoft.policyinsights/policystates',"
+                        "'microsoft.policyinsights/componentpolicystates')"),
     "securityresources": "securityresources",
+    # Recommendations / health
     "advisorresources": "advisorresources",
     "healthresources": "healthresources",
     "servicehealthresources": "servicehealthresources",
+    # Backup / business continuity
     "recoveryservicesresources": "recoveryservicesresources",
+    "azurebusinesscontinuityresources": "azurebusinesscontinuityresources",
+    # Configuration / management add-ons and governance
     "guestconfigurationresources": "guestconfigurationresources",
     "patchassessmentresources": "patchassessmentresources",
     "maintenanceresources": "maintenanceresources",
     "kubernetesconfigurationresources": "kubernetesconfigurationresources",
     "extendedlocationresources": "extendedlocationresources",
+    "featureresources": "featureresources",                 # preview feature registrations
+    "capabilityresources": "capabilityresources",
+    "deploymentresources": "deploymentresources",           # deployment stacks
+    # Networking (extended) + DNS record sets
     "networkresources": "networkresources",
-    "chaosresources": "chaosresources",
+    "dnsresources": "dnsresources",
+    # Compute / platform inventory (instance-level & specialized)
+    "computeresources": "computeresources",                 # VMSS instance VMs + NICs
+    "communitygalleryresources": "communitygalleryresources",
+    "aksresources": "aksresources",                         # AKS fleets
+    "servicefabricresources": "servicefabricresources",
+    "appserviceresources": "appserviceresources",           # site/slot config
+    "batchresources": "batchresources",
+    "kustoresources": "kustoresources",
+    "elasticsanresources": "elasticsanresources",
     "desktopvirtualizationresources": "desktopvirtualizationresources",
-    "edgeorderresources": "edgeorderresources",
+    # Specialized / other providers
+    "chaosresources": "chaosresources",
     "iotsecurityresources": "iotsecurityresources",
-    # Intentionally excluded (high-volume change history / event / fired-alert streams, not
-    # configuration): resourcechanges, healthresourcechanges, patchinstallationresources,
-    # alertsmanagementresources. Add them via --queries-dir if you really need them.
+    "edgeorderresources": "edgeorderresources",
+    "impactreportresources": "impactreportresources",
+    "azuredevopsplatformresources": "azuredevopsplatformresources",
+    "awsresources": "awsresources",                         # multicloud connector inventory
+    # Intentionally excluded:
+    #  - change-history/event streams (microsoft.resources/changes): resourcechanges,
+    #    resourcecontainerchanges, healthresourcechanges, networkresourcechanges,
+    #    maintenanceresourcechanges, quotaresourcechanges, extensibilityresourcechanges
+    #  - patchinstallationresources (patch-run events)
+    #  - alertsmanagementresources (fired alert instances)
+    #  - policyinsights policystates / componentpolicystates (per-resource compliance
+    #    evaluation, potentially millions of rows; summarized via the Policy compliance REST call)
+    # Also omitted: tables listed in the docs that ARG does not expose as directly queryable
+    # (they return HTTP 400) - tagresources (tags are already on every 'resources' row),
+    # insightresources, managedserviceresources, orbitalresources, sportresources, mirgateresources.
+    # Add any table via --queries-dir if your tenant supports it.
 }
+
 
 # --------------------------------------------------------------------------------------
 # Child sub-resource registry for exhaustive extraction (children NOT inline in parent GET).
@@ -572,24 +605,34 @@ class Snapshotter:
 
     # -- Azure Resource Graph -----------------------------------------------------------
     def arg_query(self, query: str, label=None):
-        """Yield rows for a KQL query, paging via $skipToken across all in-scope subs.
+        """Yield rows for a KQL query, honoring ARG's hard limits.
 
-        ARG returns at most 1000 rows per page; hundreds of thousands of rows are retrieved
-        by following $skipToken until it is absent. A shared semaphore bounds concurrent ARG
-        requests to protect the per-tenant query quota.
+        ARG limits handled here:
+          * <=1000 rows per page ($top) -> follow $skipToken until absent for the full set.
+          * 30s per-query timeout + subscription-count limits -> the in-scope subscriptions are
+            queried in chunks of --arg-sub-chunk (scope partitioning, as the docs recommend),
+            so no single query spans too many subscriptions.
+          * resultTruncated without $skipToken (unpageable query shape) -> warn.
+        A shared semaphore bounds concurrent ARG requests to protect the per-tenant quota.
         """
-        url = f"{self.arm}/providers/Microsoft.ResourceGraph/resources?api-version={ARG_API}"
+        if self.args.management_group:
+            yield from self._arg_paged(query, {"managementGroups": [self.args.management_group]}, label)
+            return
         sub_ids = self.sub_ids()
+        if not sub_ids:
+            yield from self._arg_paged(query, {}, label)  # tenant scope
+            return
+        chunk = self.args.arg_sub_chunk if self.args.arg_sub_chunk > 0 else len(sub_ids)
+        for i in range(0, len(sub_ids), chunk):
+            yield from self._arg_paged(query, {"subscriptions": sub_ids[i:i + chunk]}, label)
+
+    def _arg_paged(self, query, scope, label):
+        """Run one ARG query for a given scope, paging via $skipToken until exhausted."""
+        url = f"{self.arm}/providers/Microsoft.ResourceGraph/resources?api-version={ARG_API}"
         skip_token = None
         while True:
-            body = {
-                "query": query,
-                "options": {"resultFormat": "objectArray", "$top": 1000},
-            }
-            if self.args.management_group:
-                body["managementGroups"] = [self.args.management_group]
-            elif sub_ids:
-                body["subscriptions"] = sub_ids
+            body = {"query": query, "options": {"resultFormat": "objectArray", "$top": 1000}}
+            body.update(scope)
             if skip_token:
                 body["options"]["$skipToken"] = skip_token
             with self._arg_sem:
@@ -1216,6 +1259,7 @@ class Snapshotter:
                 "concurrency": self.args.concurrency,
                 "batchSize": self.args.batch_size,
                 "argConcurrency": self.args.arg_concurrency,
+                "argSubChunk": self.args.arg_sub_chunk,
                 "maxResourceDetail": self.args.max_resource_detail or None,
                 "resumed": bool(self.args.resume),
             },
@@ -1418,6 +1462,40 @@ def _qs(value):
     return quote(value, safe="")
 
 
+def _blob_error_detail(resp) -> str:
+    """Extract a readable reason from an Azure Storage error response."""
+    text = (resp.text or "").strip()
+    code = re.search(r"<Code>(.*?)</Code>", text)
+    msg = re.search(r"<Message>(.*?)</Message>", text)
+    detail = (msg.group(1).splitlines()[0] if msg else text[:200])
+    out = f"{code.group(1)}: {detail}" if code else detail
+    return out.strip(": ") or (resp.reason or f"HTTP {resp.status_code}")
+
+
+def _preflight_upload(http, args):
+    """Prove the destination SAS is writable BEFORE any extraction work by writing and
+    deleting a tiny probe blob. Returns (ok, detail). Delete is best-effort (the run itself
+    never deletes), so a missing Delete permission does not fail the check."""
+    try:
+        base, query = _split_sas(args.sas_url, args.container)
+    except Exception as exc:
+        return False, f"invalid --sas-url ({exc})"
+    url = f"{base}/.azsnapshot-preflight/{uuid.uuid4().hex}.txt?{query}"
+    headers = {"x-ms-version": BLOB_API_VERSION, "x-ms-blob-type": "BlockBlob",
+               "x-ms-blob-content-type": "text/plain"}
+    try:
+        r = http.session.put(url, data=b"azsnapshot preflight probe", headers=headers, timeout=60)
+    except requests.RequestException as exc:
+        return False, f"cannot reach the storage endpoint ({exc})"
+    if r.status_code not in (200, 201):
+        return False, _blob_error_detail(r)
+    try:
+        http.session.delete(url, headers={"x-ms-version": BLOB_API_VERSION}, timeout=60)
+    except Exception:
+        pass  # Delete may not be granted; the tiny probe blob is harmless
+    return True, "ok"
+
+
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
@@ -1451,6 +1529,9 @@ def parse_args(argv):
                    help="ARM/Graph $batch size for Stage 2 fan-out.")
     p.add_argument("--arg-concurrency", type=int, default=DEFAULT_ARG_CONCURRENCY,
                    help="Max concurrent Azure Resource Graph requests (protects the ARG quota).")
+    p.add_argument("--arg-sub-chunk", type=int, default=500,
+                   help="Max subscriptions per Resource Graph query; partitions the scope to avoid "
+                        "the 30s query timeout / subscription-count limits (0 = all in one query).")
     p.add_argument("--max-resource-detail", type=int, default=0,
                    help="Cap Stage 2 per-resource GETs (0 = unlimited); useful for very large tenants.")
     p.add_argument("--max-rps", type=float, default=0.0,
@@ -1508,18 +1589,6 @@ def main(argv=None):
     _ensure_deps(not args.no_auto_install)
     _late_imports()
 
-    # Working directory (stable when --work-dir/--resume, else temp).
-    os.makedirs(args.out, exist_ok=True)
-    if args.work_dir:
-        workdir = args.work_dir
-    elif args.resume:
-        workdir = os.path.join(args.out, ".azsnapshot-work")
-    else:
-        workdir = tempfile.mkdtemp(prefix="azsnapshot-")
-    os.makedirs(workdir, exist_ok=True)
-    if not args.resume:
-        _clear_dir(workdir)
-
     cloud = CLOUDS[args.cloud]
     scopes = {"arm": cloud["arm_scope"], "graph": cloud["graph_scope"], "kv": cloud["kv_scope"]}
 
@@ -1534,6 +1603,31 @@ def main(argv=None):
         return 3
 
     http = HttpClient(tokens, args.concurrency, args.max_rps)
+
+    # Preflight: verify the destination is writable BEFORE any extraction work, so a long run
+    # never completes only to fail at upload. Writes then deletes a tiny probe blob.
+    if not args.dry_run and args.sas_url:
+        ok, detail = _preflight_upload(http, args)
+        if not ok:
+            sys.stderr.write(
+                f"error: storage upload preflight failed: {detail}\n"
+                "The destination isn't writable - check the SAS URL is correct, not expired, and "
+                "grants Create/Write/Add on the container (or use --dry-run to skip upload).\n")
+            return 4
+        log("Preflight: storage upload verified")
+
+    # Working directory (stable when --work-dir/--resume, else temp).
+    os.makedirs(args.out, exist_ok=True)
+    if args.work_dir:
+        workdir = args.work_dir
+    elif args.resume:
+        workdir = os.path.join(args.out, ".azsnapshot-work")
+    else:
+        workdir = tempfile.mkdtemp(prefix="azsnapshot-")
+    os.makedirs(workdir, exist_ok=True)
+    if not args.resume:
+        _clear_dir(workdir)
+
     # On resume, only the expensive Stage 2 outputs are appended (and de-duplicated by id);
     # Stage 1 tables are rewritten fresh to avoid duplication.
     resumable = frozenset({"resource_detail", "diagnostic_settings"}) if args.resume else frozenset()

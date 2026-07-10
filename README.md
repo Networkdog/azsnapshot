@@ -67,17 +67,25 @@ python3 -m pip install -r requirements.txt
 
 ## What it collects
 
-**Layer 1 — Azure Resource Graph (KQL), in parallel**
+**Layer 1 — Azure Resource Graph (KQL), in parallel** — *every queryable ARG table*
 - Tenant hierarchy: management groups, subscriptions, resource groups
 - All resources with full properties, SKU, identity, tags, zones, kind
-- RBAC: role assignments, role definitions, classic administrators, deny assignments
-- Policy: assignments, definitions, initiatives, exemptions
-- Microsoft Defender for Cloud: secure scores, assessments, sub-assessments, regulatory
-  compliance, Defender plans, alerts
-- Advisor recommendations; resource & service health; backup/recovery; guest configuration;
-  patch, maintenance, Kubernetes configuration, extended-location resources
-- Additional inventory/posture tables: network, Chaos Studio, Azure Virtual Desktop,
-  Edge Order, and IoT security resources
+- Governance queried as **whole tables** so no subtype is missed: RBAC
+  (`authorizationresources`: role assignments/definitions, classic admins, deny assignments),
+  Policy configuration (`policyresources`: assignments, definitions, set definitions,
+  exemptions, metadata), Microsoft Defender for Cloud (`securityresources`: secure scores,
+  assessments, sub-assessments, regulatory compliance, Defender plans, alerts)
+- Advisor, resource & service health, backup / business-continuity, guest configuration,
+  patch assessment, maintenance, Kubernetes configuration, extended locations, deployment
+  stacks, feature registrations, capabilities
+- Networking (extended) + **DNS record sets**; compute/VMSS instances, AKS fleets, Service
+  Fabric, App Service config, Batch, Kusto, Elastic SAN, community galleries, Azure Virtual
+  Desktop, Chaos Studio, Edge Order, IoT security, Azure DevOps, and multicloud (AWS connector)
+  inventory
+- Excludes only change-history/event streams (`*changes`, fired alerts, patch-install runs)
+  and the per-resource compliance-evaluation stream (`policyStates`, potentially millions of
+  rows — summarized separately via the Policy compliance REST call). Add any omitted table
+  with `--queries-dir`
 - Scales to hundreds of thousands of rows: every table is paged (1000/page via `$skipToken`)
   and streamed straight to disk, so memory stays flat
 
@@ -147,6 +155,11 @@ file per collection plus a `manifest.json`. When uploaded, it lands at
 `manifest.json` records the run id, tenant, subscriptions in scope, options, per-category
 record **counts**, and any **warnings/errors** (per-item failures never abort the run).
 
+Before any extraction begins, the tool runs a **storage preflight**: it writes and deletes a
+tiny probe blob to confirm the SAS destination is reachable and writable. If it isn't, the run
+aborts immediately (exit code 4) with a clear message — so a long extraction never completes
+only to fail at the upload step. (`--dry-run` skips the preflight.)
+
 ---
 
 ## Azure Cloud Shell & long runs
@@ -155,19 +168,20 @@ Cloud Shell has a **~20-minute idle timeout** and then **recycles the container*
 `nohup`/background jobs do not survive. For large tenants:
 
 1. **Use `--resume` (most reliable).** Output is written to disk immediately as NDJSON, so a
-   killed run can be continued. Fetch the script into the persistent `~/clouddrive` and point
-   the working directory there too:
+   killed run can be continued. The one-liner below uses `~/clouddrive` when it exists and
+   otherwise falls back to your home directory, so it also runs on a **no-storage (ephemeral)**
+   Cloud Shell:
 
    ```bash
-   # Fetch once into persistent storage, then run (re-run the second command to resume):
-   curl -sL https://raw.githubusercontent.com/Networkdog/azsnapshot/main/azsnapshot.py \
-     -o ~/clouddrive/azsnapshot.py
-   python3 ~/clouddrive/azsnapshot.py --sas-url "$AZSNAP_SAS_URL" \
-     --work-dir ~/clouddrive/azsnap-work --resume --keep-temp
+   # One line — works with or without ~/clouddrive. Re-run the same line to resume.
+   DIR=~/clouddrive; [ -d "$DIR" ] || DIR="$HOME"; curl -sL https://raw.githubusercontent.com/Networkdog/azsnapshot/main/azsnapshot.py -o "$DIR/azsnapshot.py" && python3 "$DIR/azsnapshot.py" --sas-url "$AZSNAP_SAS_URL" --work-dir "$DIR/azsnap-work" --resume --keep-temp
    ```
 
-   Re-run the exact same command if the session drops — it skips already-collected resource
-   details and diagnostics and finishes the rest.
+   Re-run the exact same one-liner if the session drops — it skips already-collected resource
+   details and diagnostics and finishes the rest. On a no-storage Cloud Shell nothing persists
+   after the session ends, so resume only helps while the session is alive; for guaranteed
+   durability run it unattended (see below), or make the run fit the window with `--subscription`
+   / `--max-resource-detail`.
 
 2. **Scope and speed up** so a run fits in the window: `--subscription <id>` (repeatable) or
    `--management-group <id>`, raise `--concurrency`, cap Stage 2 with `--max-resource-detail`,
