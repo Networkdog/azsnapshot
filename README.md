@@ -22,6 +22,26 @@ Defender-for-Cloud–style CSPM. The snapshot is plain JSON/NDJSON, so anything 
 The tool authenticates with `DefaultAzureCredential`, so in most environments you just need
 to be signed in (`az login`) — or run it where a managed identity is available.
 
+### Azure Cloud Shell — zero install, one line
+
+Cloud Shell is already signed in and ships with Python + `curl`, so nothing needs to be
+installed. Pipe the script straight from GitHub (it then auto-installs its two dependencies):
+
+```bash
+curl -sL https://raw.githubusercontent.com/Networkdog/azsnapshot/main/azsnapshot.py \
+  | python3 - --sas-url "https://<acct>.blob.core.windows.net/<container>?<SAS>"
+```
+
+To keep the SAS out of your shell history, pass it as an environment variable — prefix it on
+the Python side so the piped process inherits it:
+
+```bash
+curl -sL https://raw.githubusercontent.com/Networkdog/azsnapshot/main/azsnapshot.py \
+  | AZSNAP_SAS_URL="https://<acct>.blob.core.windows.net/<container>?<SAS>" python3 -
+```
+
+### Local (or any machine that has the file)
+
 ```bash
 # 1) Sign in (skip in Azure Cloud Shell — you're already signed in)
 az login
@@ -56,6 +76,10 @@ python3 -m pip install -r requirements.txt
   compliance, Defender plans, alerts
 - Advisor recommendations; resource & service health; backup/recovery; guest configuration;
   patch, maintenance, Kubernetes configuration, extended-location resources
+- Additional inventory/posture tables: network, Chaos Studio, Azure Virtual Desktop,
+  Edge Order, and IoT security resources
+- Scales to hundreds of thousands of rows: every table is paged (1000/page via `$skipToken`)
+  and streamed straight to disk, so memory stays flat
 
 **Layer 2 — Exhaustive ARM REST (batched, parallel)**
 - A full authoritative **GET on every resource** at its latest API version (captures details
@@ -67,7 +91,7 @@ python3 -m pip install -r requirements.txt
 - **Resource locks**, **management-group hierarchy**, **provider registrations**,
   **budgets**, and a **Policy compliance summary**
 
-**Layer 3 — Microsoft Entra ID (Microsoft Graph)**
+**Layer 3 — Microsoft Entra ID (Microsoft Graph)** — *opt-in with `--include-entra` (off by default)*
 - Organization, domains, users, groups (+ memberships), service principals, application
   registrations, directory roles, administrative units, OAuth2 permission grants,
   directory role definitions/assignments, **PIM** eligible/active assignments,
@@ -83,7 +107,7 @@ If a Graph permission is missing, that collector is skipped with a warning (the 
 | --- | --- |
 | Resources, config, RBAC, Policy, exhaustive GET | **Reader** at the tenant root management group (or per subscription) |
 | Defender for Cloud data | **Security Reader** |
-| Microsoft Entra ID (Layer 3) | Microsoft Graph **Directory.Read.All** (plus **Policy.Read.All** and **RoleManagement.Read.Directory** for Conditional Access / PIM) |
+| Microsoft Entra ID (Layer 3, opt-in `--include-entra`) | Microsoft Graph **Directory.Read.All** (plus **Policy.Read.All** and **RoleManagement.Read.Directory** for Conditional Access / PIM) |
 | Key Vault object metadata (opt-in, `--include-keyvault-metadata`) | **Key Vault Reader** (data-plane; names/expiry only, never values) |
 | Upload destination | A **container SAS** with `Create`, `Write`, `Add` (and `List`) permissions |
 
@@ -131,11 +155,14 @@ Cloud Shell has a **~20-minute idle timeout** and then **recycles the container*
 `nohup`/background jobs do not survive. For large tenants:
 
 1. **Use `--resume` (most reliable).** Output is written to disk immediately as NDJSON, so a
-   killed run can be continued. Point it at a stable working directory under the persistent
-   `~/clouddrive`:
+   killed run can be continued. Fetch the script into the persistent `~/clouddrive` and point
+   the working directory there too:
 
    ```bash
-   python3 azsnapshot.py --sas-url "$AZSNAP_SAS_URL" \
+   # Fetch once into persistent storage, then run (re-run the second command to resume):
+   curl -sL https://raw.githubusercontent.com/Networkdog/azsnapshot/main/azsnapshot.py \
+     -o ~/clouddrive/azsnapshot.py
+   python3 ~/clouddrive/azsnapshot.py --sas-url "$AZSNAP_SAS_URL" \
      --work-dir ~/clouddrive/azsnap-work --resume --keep-temp
    ```
 
@@ -143,9 +170,9 @@ Cloud Shell has a **~20-minute idle timeout** and then **recycles the container*
    details and diagnostics and finishes the rest.
 
 2. **Scope and speed up** so a run fits in the window: `--subscription <id>` (repeatable) or
-   `--management-group <id>`, raise `--concurrency`, and disable the heaviest steps with
-   `--no-diagnostics` and `--no-group-members`. Use `--resource-detail arg-only` to skip the
-   exhaustive Stage 2 entirely for a fast inventory.
+   `--management-group <id>`, raise `--concurrency`, cap Stage 2 with `--max-resource-detail`,
+   and disable the heaviest step with `--no-diagnostics`. Use `--resource-detail arg-only` to
+   skip the exhaustive Stage 2 entirely for a fast inventory.
 
 3. **Keep the session active** with `tmux` (available in Cloud Shell). The tool also prints a
    heartbeat every ~60s.
@@ -185,6 +212,25 @@ scheduled pipeline.
 
 ---
 
+## Scale (large / enterprise tenants)
+
+Enterprise tenants routinely have hundreds of thousands of resources. The tool is built for
+that:
+
+- **Flat memory**: Resource Graph results are paged (1000 rows/page via `$skipToken`) and
+  streamed to disk; the Stage 2 worklist lives in a temp file, not memory, and per-resource
+  work is fanned out with a bounded number of in-flight batches.
+- **ARG quota protection**: `--arg-concurrency` (default 4) caps concurrent Resource Graph
+  requests, and the tool honors ARG quota headers and retries on throttling.
+- **Bounded Stage 2**: a full per-resource GET across hundreds of thousands of resources is
+  heavy — use `--max-resource-detail N` to cap it, `--resource-detail arg-only` to skip it, or
+  `--subscription` / `--management-group` to scope the run. `--resume` continues where a
+  killed run left off (Stage 2 items already collected are skipped).
+- **Completeness**: if Resource Graph ever reports `resultTruncated`, the tool warns you to
+  scope the run so nothing is silently dropped.
+
+---
+
 ## Options
 
 Run `python3 azsnapshot.py --help` for the full list. Frequently used:
@@ -198,8 +244,10 @@ Run `python3 azsnapshot.py --help` for the full list. Frequently used:
 | `--resource-detail full\|arg-only` | Exhaustive Stage 2 (default) vs fast inventory |
 | `--concurrency` | Parallel worker threads (default 16) |
 | `--batch-size` | ARM/Graph `$batch` size (default 20) |
+| `--arg-concurrency` | Max concurrent Resource Graph requests (default 4; protects the ARG quota) |
+| `--max-resource-detail` | Cap Stage 2 per-resource GETs (0 = unlimited); useful for very large tenants |
 | `--work-dir` + `--resume` | Stable working dir + continue a prior run |
-| `--no-entra` / `--no-group-members` | Skip Entra ID / skip group membership expansion |
+| `--include-entra` / `--no-group-members` | Collect Entra ID (off by default) / skip group membership expansion |
 | `--no-diagnostics` / `--no-children` | Skip diagnostic settings / child sub-resources |
 | `--include-keyvault-metadata` | Add Key Vault object metadata (names/expiry, no values) |
 | `--cloud` | `AzureCloud` (default), `AzureUSGovernment`, `AzureChinaCloud` |

@@ -90,6 +90,8 @@ GRAPH_VERSION = "v1.0"
 # Tuning defaults
 DEFAULT_CONCURRENCY = 16
 DEFAULT_BATCH_SIZE = 20
+DEFAULT_ARG_CONCURRENCY = 4
+LARGE_TENANT_WARN = 100000
 HEARTBEAT_SECONDS = 60
 HTTP_TIMEOUT = 120
 MAX_HTTP_ATTEMPTS = 6
@@ -122,6 +124,14 @@ KQL_CATALOG = {
     "maintenanceresources": "maintenanceresources",
     "kubernetesconfigurationresources": "kubernetesconfigurationresources",
     "extendedlocationresources": "extendedlocationresources",
+    "networkresources": "networkresources",
+    "chaosresources": "chaosresources",
+    "desktopvirtualizationresources": "desktopvirtualizationresources",
+    "edgeorderresources": "edgeorderresources",
+    "iotsecurityresources": "iotsecurityresources",
+    # Intentionally excluded (high-volume change history / event / fired-alert streams, not
+    # configuration): resourcechanges, healthresourcechanges, patchinstallationresources,
+    # alertsmanagementresources. Add them via --queries-dir if you really need them.
 }
 
 # --------------------------------------------------------------------------------------
@@ -395,9 +405,9 @@ class HttpClient:
 # Output writer: thread-safe NDJSON, one file per category, append-friendly for --resume.
 # --------------------------------------------------------------------------------------
 class SnapshotWriter:
-    def __init__(self, workdir: str, append: bool):
+    def __init__(self, workdir: str, append_categories=frozenset()):
         self.workdir = workdir
-        self._mode = "a" if append else "w"
+        self._append = set(append_categories)
         self._files: dict = {}
         self._locks: dict = {}
         self._create_lock = threading.Lock()
@@ -409,8 +419,9 @@ class SnapshotWriter:
         with self._create_lock:
             f = self._files.get(category)
             if f is None:
+                mode = "a" if category in self._append else "w"
                 path = os.path.join(self.workdir, category + ".ndjson")
-                f = open(path, self._mode, encoding="utf-8")
+                f = open(path, mode, encoding="utf-8")
                 self._files[category] = f
                 self._locks[category] = threading.Lock()
             return self._files[category], self._locks[category]
@@ -491,6 +502,8 @@ class Snapshotter:
         self.subscriptions: list = []
         self.api_versions: dict = {}
         self._counter = itertools.count(1)
+        self._arg_sem = threading.BoundedSemaphore(max(1, args.arg_concurrency))
+        self.resource_count = 0
         self._done_ids = set()      # for --resume (Stage 2 resource detail)
         self._done_diag = set()     # for --resume (diagnostics)
         self._hb_stop = threading.Event()
@@ -558,8 +571,13 @@ class Snapshotter:
         return [s["subscriptionId"] for s in self.subscriptions]
 
     # -- Azure Resource Graph -----------------------------------------------------------
-    def arg_query(self, query: str):
-        """Yield rows for a KQL query, paging via $skipToken across all in-scope subs."""
+    def arg_query(self, query: str, label=None):
+        """Yield rows for a KQL query, paging via $skipToken across all in-scope subs.
+
+        ARG returns at most 1000 rows per page; hundreds of thousands of rows are retrieved
+        by following $skipToken until it is absent. A shared semaphore bounds concurrent ARG
+        requests to protect the per-tenant query quota.
+        """
         url = f"{self.arm}/providers/Microsoft.ResourceGraph/resources?api-version={ARG_API}"
         sub_ids = self.sub_ids()
         skip_token = None
@@ -574,13 +592,18 @@ class Snapshotter:
                 body["subscriptions"] = sub_ids
             if skip_token:
                 body["options"]["$skipToken"] = skip_token
-            resp = self.http.request("POST", url, "arm", json_body=body)
+            with self._arg_sem:
+                resp = self.http.request("POST", url, "arm", json_body=body)
             self._respect_arg_quota(resp)
             data = resp.json()
             for row in data.get("data", []):
                 yield row
             skip_token = data.get("$skipToken")
             if not skip_token:
+                if str(data.get("resultTruncated", "")).lower() == "true":
+                    self.warn("arg", label or "query",
+                              "resultTruncated: results may be incomplete - scope the run with "
+                              "--subscription or --management-group")
                 break
 
     @staticmethod
@@ -599,7 +622,7 @@ class Snapshotter:
         try:
             count = 0
             batch = []
-            for row in self.arg_query(query):
+            for row in self.arg_query(query, label=category):
                 batch.append(row)
                 if len(batch) >= 500:
                     count += self.writer.write_many(category, batch)
@@ -612,26 +635,46 @@ class Snapshotter:
         except Exception as exc:
             self.error("arg", category, exc)
 
-    def collect_resources_and_worklist(self):
-        """Stream the 'resources' table and build the (id, type) worklist for Stage 2."""
-        worklist = []
+    def collect_resources(self):
+        """Stream the 'resources' table to disk and write a compact on-disk worklist
+        (_worklist.tsv) for Stage 2. Nothing is held in memory, so this scales to
+        hundreds of thousands / millions of resources."""
+        count = 0
+        batch = []
+        wl_path = os.path.join(self.writer.workdir, "_worklist.tsv")
         try:
-            count = 0
-            batch = []
-            for row in self.arg_query("resources"):
-                rid = row.get("id")
-                rtype = (row.get("type") or "").lower()
-                if rid:
-                    worklist.append((rid, rtype, row.get("name"), row.get("location")))
-                batch.append(row)
-                if len(batch) >= 500:
-                    count += self.writer.write_many("resources", batch)
-                    batch = []
-            count += self.writer.write_many("resources", batch)
-            log(f"ARG resources: {count}")
+            with open(wl_path, "w", encoding="utf-8") as wl:
+                for row in self.arg_query("resources", label="resources"):
+                    rid = row.get("id")
+                    if rid:
+                        rtype = (row.get("type") or "").lower()
+                        name = (row.get("name") or "").replace("\t", " ").replace("\n", " ")
+                        loc = (row.get("location") or "").replace("\t", " ").replace("\n", " ")
+                        wl.write(f"{rid}\t{rtype}\t{name}\t{loc}\n")
+                    batch.append(row)
+                    if len(batch) >= 500:
+                        count += self.writer.write_many("resources", batch)
+                        batch = []
+                count += self.writer.write_many("resources", batch)
         except Exception as exc:
             self.error("arg", "resources", exc)
-        return worklist
+        self.resource_count = count
+        log(f"ARG resources: {count}")
+
+    def _iter_worklist(self):
+        """Yield (id, type, name, location) tuples streamed from _worklist.tsv."""
+        path = os.path.join(self.writer.workdir, "_worklist.tsv")
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 4:
+                    parts += [""] * (4 - len(parts))
+                yield parts[0], parts[1], parts[2], parts[3]
 
     # -- providers + API version discovery ---------------------------------------------
     def collect_providers_and_versions(self) -> None:
@@ -661,13 +704,29 @@ class Snapshotter:
         return self.api_versions.get(rtype.lower()) or "2021-04-01"
 
     # -- Stage 2: exhaustive per-resource detail via ARM $batch -------------------------
-    def collect_resource_details(self, worklist) -> None:
-        pending = [(rid, rtype) for (rid, rtype, _n, _l) in worklist if rid not in self._done_ids]
-        self._progress["resource_total"] = len(worklist)
+    def collect_resource_details(self) -> None:
+        total = self.resource_count
+        self._progress["resource_total"] = total
         self._progress["resource_detail"] = len(self._done_ids)
-        log(f"Stage 2: {len(pending)} resource detail GET(s) "
-            f"({len(self._done_ids)} already done)" if self._done_ids else
-            f"Stage 2: {len(pending)} resource detail GET(s)")
+        if total >= LARGE_TENANT_WARN:
+            log(f"NOTE: {total} resources - Stage 2 (full per-resource GET) is very large. "
+                f"Consider --resource-detail arg-only, --subscription/--management-group scoping, "
+                f"or --max-resource-detail.")
+        log(f"Stage 2: resource detail for up to {total} resource(s)"
+            + (f" ({len(self._done_ids)} already done)" if self._done_ids else ""))
+        cap = self.args.max_resource_detail
+
+        def gen():
+            n = 0
+            for rid, rtype, _n, _l in self._iter_worklist():
+                if rid in self._done_ids:
+                    continue
+                yield (rid, rtype)
+                n += 1
+                if cap and n >= cap:
+                    self.warn("resource_detail", "cap",
+                              f"--max-resource-detail {cap} reached; remaining resources skipped")
+                    return
 
         def do_batch(items):
             reqs = []
@@ -695,51 +754,53 @@ class Snapshotter:
             self.writer.write_many("resource_detail", out)
             self._progress["resource_detail"] += len(items)
 
-        self._for_each_chunk(pending, self.args.batch_size, do_batch, stage="resource_detail")
+        self._stream_chunks(gen(), self.args.batch_size, do_batch, stage="resource_detail")
 
-        # child sub-resources for types in the registry
         if not self.args.no_children:
-            self.collect_children(worklist)
+            self.collect_children()
 
-    def collect_children(self, worklist) -> None:
-        tasks = []
-        for (rid, rtype, _n, _l) in worklist:
-            paths = CHILD_REGISTRY.get(rtype)
-            if not paths:
-                continue
-            tasks.append((rid, rtype, paths))
-        if not tasks:
-            return
-        log(f"Stage 2: enumerating children for {len(tasks)} parent resource(s)")
+    def collect_children(self) -> None:
+        def gen():
+            for rid, rtype, _n, _l in self._iter_worklist():
+                paths = CHILD_REGISTRY.get(rtype)
+                if paths:
+                    yield (rid, rtype, paths)
 
-        def do_one(entry):
-            rid, rtype, paths = entry
-            api = self.api_version_for(rtype)
-            for rel, redact_values in paths:
-                full = f"{rid}/{rel}"
-                try:
-                    data = self.arm_get(full, api, allow=(400, 403, 404, 405, 409, 501))
-                except HttpError as exc:
-                    if exc.status not in (400, 403, 404, 405, 409, 501):
+        def do_chunk(entries):
+            for rid, rtype, paths in entries:
+                api = self.api_version_for(rtype)
+                for rel, redact_values in paths:
+                    full = f"{rid}/{rel}"
+                    try:
+                        data = self.arm_get(full, api, allow=(400, 403, 404, 405, 409, 501))
+                    except HttpError as exc:
+                        if exc.status not in (400, 403, 404, 405, 409, 501):
+                            self.warn("children", full, exc)
+                        continue
+                    except Exception as exc:
                         self.warn("children", full, exc)
-                    continue
-                except Exception as exc:
-                    self.warn("children", full, exc)
-                    continue
-                if data is None:
-                    continue
-                items = data.get("value") if isinstance(data, dict) and "value" in data else [data]
-                for item in items:
-                    if redact_values:
-                        item = _blank_setting_values(item)
-                    self.writer.write("resource_children", {"parentId": rid, "childType": rel, "child": item})
+                        continue
+                    if data is None:
+                        continue
+                    items = data.get("value") if isinstance(data, dict) and "value" in data else [data]
+                    for item in items:
+                        if redact_values:
+                            item = _blank_setting_values(item)
+                        self.writer.write("resource_children",
+                                          {"parentId": rid, "childType": rel, "child": item})
 
-        self._map(do_one, tasks, stage="children")
+        log("Stage 2: enumerating child sub-resources")
+        self._stream_chunks(gen(), 8, do_chunk, stage="children")
 
     # -- Stage 2: diagnostic settings ---------------------------------------------------
-    def collect_diagnostics(self, worklist) -> None:
-        targets = [(rid, rtype) for (rid, rtype, _n, _l) in worklist if rid not in self._done_diag]
-        log(f"Stage 2: diagnostic settings for {len(targets)} resource(s)")
+    def collect_diagnostics(self) -> None:
+        log("Stage 2: diagnostic settings")
+
+        def gen():
+            for rid, rtype, _n, _l in self._iter_worklist():
+                if rid in self._done_diag:
+                    continue
+                yield (rid, rtype)
 
         def do_batch(items):
             reqs = []
@@ -765,7 +826,7 @@ class Snapshotter:
             if out:
                 self.writer.write_many("diagnostic_settings", out)
 
-        self._for_each_chunk(targets, self.args.batch_size, do_batch, stage="diagnostics")
+        self._stream_chunks(gen(), self.args.batch_size, do_batch, stage="diagnostics")
 
     # -- ARM $batch --------------------------------------------------------------------
     def _arm_batch(self, reqs):
@@ -867,8 +928,8 @@ class Snapshotter:
         self._map(one, self.sub_ids(), stage="policy_compliance")
 
     # -- Key Vault object metadata (opt-in, data-plane LIST, no values) -----------------
-    def collect_keyvault_metadata(self, worklist) -> None:
-        vaults = [(rid, name) for (rid, rtype, name, _l) in worklist
+    def collect_keyvault_metadata(self) -> None:
+        vaults = [(rid, name) for (rid, rtype, name, _l) in self._iter_worklist()
                   if rtype == "microsoft.keyvault/vaults" and name]
         if not vaults:
             return
@@ -896,7 +957,7 @@ class Snapshotter:
 
     # -- Microsoft Entra ID via Graph ---------------------------------------------------
     def collect_entra(self) -> None:
-        if self.args.no_entra:
+        if not self.args.include_entra:
             return
         log("Entra ID: collecting directory objects")
         self._map(self._entra_one, GRAPH_COLLECTORS, stage="entra")
@@ -1012,6 +1073,35 @@ class Snapshotter:
             except Exception as exc:
                 self.error(stage, f"chunk-{future_map[fut]}", exc)
 
+    def _stream_chunks(self, item_iter, size, fn, stage: str, max_inflight=None):
+        """Chunk a (possibly huge) iterator and run fn(chunk) in parallel with a bounded
+        number of in-flight futures, so memory stays flat regardless of total size."""
+        if max_inflight is None:
+            max_inflight = max(2, self.args.concurrency * 2)
+        inflight = set()
+
+        def drain(target):
+            while len(inflight) > target:
+                done, _ = futures.wait(inflight, return_when=futures.FIRST_COMPLETED)
+                for fut in done:
+                    inflight.discard(fut)
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        self.error(stage, "chunk", exc)
+
+        chunk = []
+        for item in item_iter:
+            chunk.append(item)
+            if len(chunk) >= size:
+                inflight.add(self.executor.submit(fn, chunk))
+                chunk = []
+                if len(inflight) >= max_inflight:
+                    drain(max_inflight - 1)
+        if chunk:
+            inflight.add(self.executor.submit(fn, chunk))
+        drain(0)
+
     # -- heartbeat ----------------------------------------------------------------------
     def _heartbeat(self, started):
         while not self._hb_stop.wait(HEARTBEAT_SECONDS):
@@ -1043,20 +1133,19 @@ class Snapshotter:
             # collection each run on their own thread. None of those threads is a pool
             # worker, so the shared executor is only ever driven from non-worker threads,
             # which avoids nested submission / deadlock even at --concurrency 1.
-            log("Stage 1: discovery (ARG + governance + Entra) in parallel")
-            holder = {}
+            log("Stage 1: discovery (ARG + governance%s) in parallel"
+                % (" + Entra" if self.args.include_entra else ""))
 
             def _resources():
                 try:
-                    holder["worklist"] = self.collect_resources_and_worklist()
+                    self.collect_resources()
                 except Exception as exc:
                     self.error("arg", "resources", exc)
-                    holder["worklist"] = []
 
             res_thread = threading.Thread(target=_resources, daemon=True)
             res_thread.start()
             entra_thread = None
-            if not self.args.no_entra:
+            if self.args.include_entra:
                 def _entra():
                     try:
                         self.collect_entra()
@@ -1073,18 +1162,20 @@ class Snapshotter:
             res_thread.join()
             if entra_thread:
                 entra_thread.join()
-            worklist = holder.get("worklist", [])
-            log(f"Stage 1 complete: {len(worklist)} resources discovered")
+            log(f"Stage 1 complete: {self.resource_count} resources discovered")
 
             # Stage 2: exhaustive per-resource detail (+ children, diagnostics, KV metadata).
-            if self.args.resource_detail == "full" and worklist:
-                self.collect_resource_details(worklist)
+            # Everything streams from the on-disk worklist, so memory stays flat even at
+            # hundreds of thousands / millions of resources.
+            if self.args.resource_detail == "full" and self.resource_count:
+                self.collect_resource_details()
                 if not self.args.no_diagnostics:
-                    self.collect_diagnostics(worklist)
+                    self.collect_diagnostics()
                 if self.args.include_keyvault_metadata:
-                    self.collect_keyvault_metadata(worklist)
+                    self.collect_keyvault_metadata()
             else:
-                log("Stage 2 skipped (resource-detail=arg-only)" if worklist else "Stage 2: no resources")
+                log("Stage 2 skipped (resource-detail=arg-only)"
+                    if self.resource_count else "Stage 2: no resources")
         except Exception as exc:
             # Never lose a partial snapshot to an unexpected error - record and still finalize.
             self.error("run", "-", exc)
@@ -1117,13 +1208,15 @@ class Snapshotter:
             "managementGroupScope": self.args.management_group,
             "options": {
                 "resourceDetail": self.args.resource_detail,
-                "entra": not self.args.no_entra,
+                "entra": self.args.include_entra,
                 "groupMembers": not self.args.no_group_members,
                 "diagnostics": not self.args.no_diagnostics,
                 "children": not self.args.no_children,
                 "keyVaultMetadata": self.args.include_keyvault_metadata,
                 "concurrency": self.args.concurrency,
                 "batchSize": self.args.batch_size,
+                "argConcurrency": self.args.arg_concurrency,
+                "maxResourceDetail": self.args.max_resource_detail or None,
                 "resumed": bool(self.args.resume),
             },
             "counts": counts,
@@ -1302,6 +1395,8 @@ def _make_zip(workdir, zip_path):
     os.makedirs(os.path.dirname(os.path.abspath(zip_path)), exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for name in sorted(os.listdir(workdir)):
+            if name.startswith("_"):  # internal scratch files (e.g., _worklist.tsv)
+                continue
             full = os.path.join(workdir, name)
             if os.path.isfile(full):
                 zf.write(full, arcname=name)
@@ -1354,14 +1449,19 @@ def parse_args(argv):
                    help="Parallel worker threads.")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
                    help="ARM/Graph $batch size for Stage 2 fan-out.")
+    p.add_argument("--arg-concurrency", type=int, default=DEFAULT_ARG_CONCURRENCY,
+                   help="Max concurrent Azure Resource Graph requests (protects the ARG quota).")
+    p.add_argument("--max-resource-detail", type=int, default=0,
+                   help="Cap Stage 2 per-resource GETs (0 = unlimited); useful for very large tenants.")
     p.add_argument("--max-rps", type=float, default=0.0,
                    help="Optional client-side requests/sec cap (0 = disabled).")
     p.add_argument("--cloud", choices=list(CLOUDS.keys()), default="AzureCloud",
                    help="Azure cloud environment.")
     p.add_argument("--tenant", default=None, help="Tenant ID hint for authentication.")
-    p.add_argument("--no-entra", action="store_true", help="Skip Microsoft Entra ID (Graph) collection.")
+    p.add_argument("--include-entra", action="store_true",
+                   help="Also collect Microsoft Entra ID (Graph) directory objects (off by default).")
     p.add_argument("--no-group-members", action="store_true",
-                   help="Skip Entra group membership expansion (the heaviest Graph step).")
+                   help="With --include-entra, skip group membership expansion (the heaviest Graph step).")
     p.add_argument("--no-diagnostics", action="store_true",
                    help="Skip per-resource diagnostic settings.")
     p.add_argument("--no-children", action="store_true",
@@ -1434,7 +1534,10 @@ def main(argv=None):
         return 3
 
     http = HttpClient(tokens, args.concurrency, args.max_rps)
-    writer = SnapshotWriter(workdir, append=args.resume)
+    # On resume, only the expensive Stage 2 outputs are appended (and de-duplicated by id);
+    # Stage 1 tables are rewritten fresh to avoid duplication.
+    resumable = frozenset({"resource_detail", "diagnostic_settings"}) if args.resume else frozenset()
+    writer = SnapshotWriter(workdir, append_categories=resumable)
     snap = Snapshotter(args, cloud, tokens, http, writer)
 
     manifest, zip_path, blob_url = snap.run()
