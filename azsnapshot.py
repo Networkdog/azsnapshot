@@ -83,6 +83,10 @@ MG_API = "2020-05-01"
 DIAG_API = "2021-05-01-preview"
 BUDGETS_API = "2021-10-01"
 POLICYSTATES_API = "2019-10-01"
+SECURITY_PRICINGS_API = "2024-01-01"          # Microsoft Defender for Cloud plans
+SECURITY_SETTINGS_API = "2022-05-01"           # Defender settings (MCAS/WDATP/alert sync)
+SECURITY_AUTOPROV_API = "2017-08-01-preview"   # only version exposed
+SECURITY_WORKSPACE_API = "2017-08-01-preview"  # only version exposed
 KV_DATAPLANE_API = "7.4"
 BLOB_API_VERSION = "2021-08-06"
 GRAPH_VERSION = "v1.0"
@@ -202,8 +206,20 @@ CHILD_REGISTRY = {
 }
 
 # --------------------------------------------------------------------------------------
-# Microsoft Graph (Entra ID) collectors: (category, path, params, required_permission_hint)
-# Each is a paged list. A 403 is recorded as a warning and skipped.
+# Microsoft Graph (Entra ID) collectors: (category, path, params). Each is a paged list;
+# a 403/401 is recorded as a warning and skipped. Collectors are split into two tiers so
+# that the DEFAULT run never reads personal data:
+#
+#   GRAPH_TENANT_COLLECTORS    - tenant-wide CONFIGURATION only. No personal profile data
+#                                (no names, emails, UPNs, memberships). Collected BY DEFAULT.
+#                                Conditional Access / named locations are configuration too;
+#                                they may embed opaque principal object-IDs (GUIDs) but never
+#                                personal attributes. Opt out with --no-entra-tenant.
+#   GRAPH_DIRECTORY_COLLECTORS - directory PRINCIPALS and their access (users, groups +
+#                                memberships, service principals, app registrations,
+#                                directory role assignments, PIM). This is personal /
+#                                principal-identifying data; collected only with
+#                                --include-entra (OFF by default).
 # --------------------------------------------------------------------------------------
 GRAPH_USER_SELECT = (
     "id,displayName,userPrincipalName,mail,accountEnabled,userType,createdDateTime,"
@@ -213,9 +229,24 @@ GRAPH_GROUP_SELECT = (
     "id,displayName,description,mail,mailEnabled,securityEnabled,groupTypes,visibility,"
     "membershipRule,membershipRuleProcessingState,isAssignableToRole,createdDateTime"
 )
-GRAPH_COLLECTORS = [
+GRAPH_TENANT_COLLECTORS = [
     ("entra_organization", "organization", {}),
     ("entra_domains", "domains", {}),
+    ("entra_authorization_policy", "policies/authorizationPolicy", {}),
+    ("entra_security_defaults_policy", "policies/identitySecurityDefaultsEnforcementPolicy", {}),
+    ("entra_authentication_methods_policy", "policies/authenticationMethodsPolicy", {}),
+    ("entra_admin_consent_request_policy", "policies/adminConsentRequestPolicy", {}),
+    ("entra_permission_grant_policies", "policies/permissionGrantPolicies", {}),
+    ("entra_cross_tenant_access_default", "policies/crossTenantAccessPolicy/default", {}),
+    ("entra_cross_tenant_access_partners", "policies/crossTenantAccessPolicy/partners", {}),
+    ("entra_directory_settings", "settings", {}),
+    ("entra_subscribed_skus", "subscribedSkus", {}),
+    ("entra_directory_role_templates", "directoryRoleTemplates", {}),
+    ("entra_role_definitions", "roleManagement/directory/roleDefinitions", {}),
+    ("entra_conditional_access", "identity/conditionalAccess/policies", {}),
+    ("entra_named_locations", "identity/conditionalAccess/namedLocations", {}),
+]
+GRAPH_DIRECTORY_COLLECTORS = [
     ("entra_users", "users", {"$select": GRAPH_USER_SELECT}),
     ("entra_groups", "groups", {"$select": GRAPH_GROUP_SELECT}),
     ("entra_service_principals", "servicePrincipals", {}),
@@ -223,12 +254,9 @@ GRAPH_COLLECTORS = [
     ("entra_directory_roles", "directoryRoles", {}),
     ("entra_administrative_units", "directory/administrativeUnits", {}),
     ("entra_oauth2_permission_grants", "oauth2PermissionGrants", {}),
-    ("entra_role_definitions", "roleManagement/directory/roleDefinitions", {}),
     ("entra_role_assignments", "roleManagement/directory/roleAssignments", {}),
     ("entra_pim_eligible", "roleManagement/directory/roleEligibilityScheduleInstances", {}),
     ("entra_pim_active", "roleManagement/directory/roleAssignmentScheduleInstances", {}),
-    ("entra_conditional_access", "identity/conditionalAccess/policies", {}),
-    ("entra_named_locations", "identity/conditionalAccess/namedLocations", {}),
 ]
 
 # --------------------------------------------------------------------------------------
@@ -904,6 +932,7 @@ class Snapshotter:
         self.collect_management_groups()
         self.collect_budgets()
         self.collect_policy_compliance()
+        self.collect_defender_settings()
 
     def collect_locks(self) -> None:
         def one(sub_id):
@@ -970,6 +999,38 @@ class Snapshotter:
                 self.warn("policy_compliance", sub_id, exc)
         self._map(one, self.sub_ids(), stage="policy_compliance")
 
+    def collect_defender_settings(self) -> None:
+        """Microsoft Defender for Cloud tenant/subscription CONFIGURATION (non-PII).
+        These settings are NOT exposed by Resource Graph's securityresources table, which
+        holds assessment RESULTS rather than the plan / auto-provisioning configuration.
+        securityContacts is intentionally excluded (it holds notification emails/phones)."""
+        if self.args.no_defender_settings:
+            return
+        endpoints = [
+            ("defender_pricings", "Microsoft.Security/pricings", SECURITY_PRICINGS_API),
+            ("defender_auto_provisioning", "Microsoft.Security/autoProvisioningSettings",
+             SECURITY_AUTOPROV_API),
+            ("defender_settings", "Microsoft.Security/settings", SECURITY_SETTINGS_API),
+            ("defender_workspace_settings", "Microsoft.Security/workspaceSettings",
+             SECURITY_WORKSPACE_API),
+        ]
+
+        def one(sub_id):
+            for category, provider_path, api in endpoints:
+                path = f"/subscriptions/{sub_id}/providers/{provider_path}"
+                try:
+                    items = self.arm_get_all(path, api)
+                except HttpError as exc:
+                    if exc.status not in (400, 403, 404):
+                        self.warn("defender_settings", f"{sub_id}/{provider_path}", exc)
+                    continue
+                except Exception as exc:
+                    self.warn("defender_settings", f"{sub_id}/{provider_path}", exc)
+                    continue
+                self.writer.write_many(category, [{"subscriptionId": sub_id, **i} for i in items])
+
+        self._map(one, self.sub_ids(), stage="defender_settings")
+
     # -- Key Vault object metadata (opt-in, data-plane LIST, no values) -----------------
     def collect_keyvault_metadata(self) -> None:
         vaults = [(rid, name) for (rid, rtype, name, _l) in self._iter_worklist()
@@ -999,12 +1060,23 @@ class Snapshotter:
         self._map(one, vaults, stage="keyvault")
 
     # -- Microsoft Entra ID via Graph ---------------------------------------------------
+    def entra_enabled(self) -> bool:
+        """True when any Entra/Graph collection is requested (tenant config and/or directory)."""
+        return (not self.args.no_entra_tenant) or self.args.include_entra
+
     def collect_entra(self) -> None:
-        if not self.args.include_entra:
+        specs = []
+        if not self.args.no_entra_tenant:
+            specs.extend(GRAPH_TENANT_COLLECTORS)
+        if self.args.include_entra:
+            specs.extend(GRAPH_DIRECTORY_COLLECTORS)
+        if not specs:
             return
-        log("Entra ID: collecting directory objects")
-        self._map(self._entra_one, GRAPH_COLLECTORS, stage="entra")
-        if not self.args.no_group_members:
+        log("Entra ID: collecting %s" % (
+            "tenant configuration + directory principals"
+            if self.args.include_entra else "tenant configuration (no personal data)"))
+        self._map(self._entra_one, specs, stage="entra")
+        if self.args.include_entra and not self.args.no_group_members:
             self.collect_group_members()
 
     def _entra_one(self, spec):
@@ -1013,8 +1085,12 @@ class Snapshotter:
             count = self._graph_write(category, path, params)
             log(f"Graph {category}: {count}")
         except HttpError as exc:
-            if exc.status in (403, 401):
+            if exc.status in (401, 403):
                 self.warn("entra", category, f"insufficient Graph permission ({exc.status})")
+            elif exc.status in (400, 404):
+                # License-gated (e.g. Conditional Access needs Entra ID P1) or not present in
+                # this tenant/sovereign cloud - benign, skip without inflating the error count.
+                self.warn("entra", category, f"not available in this tenant/cloud ({exc.status})")
             else:
                 self.error("entra", category, exc)
         except Exception as exc:
@@ -1177,7 +1253,7 @@ class Snapshotter:
             # worker, so the shared executor is only ever driven from non-worker threads,
             # which avoids nested submission / deadlock even at --concurrency 1.
             log("Stage 1: discovery (ARG + governance%s) in parallel"
-                % (" + Entra" if self.args.include_entra else ""))
+                % (" + Entra" if self.entra_enabled() else ""))
 
             def _resources():
                 try:
@@ -1188,7 +1264,7 @@ class Snapshotter:
             res_thread = threading.Thread(target=_resources, daemon=True)
             res_thread.start()
             entra_thread = None
-            if self.args.include_entra:
+            if self.entra_enabled():
                 def _entra():
                     try:
                         self.collect_entra()
@@ -1252,6 +1328,8 @@ class Snapshotter:
             "options": {
                 "resourceDetail": self.args.resource_detail,
                 "entra": self.args.include_entra,
+                "entraTenantConfig": not self.args.no_entra_tenant,
+                "defenderSettings": not self.args.no_defender_settings,
                 "groupMembers": not self.args.no_group_members,
                 "diagnostics": not self.args.no_diagnostics,
                 "children": not self.args.no_children,
@@ -1540,7 +1618,16 @@ def parse_args(argv):
                    help="Azure cloud environment.")
     p.add_argument("--tenant", default=None, help="Tenant ID hint for authentication.")
     p.add_argument("--include-entra", action="store_true",
-                   help="Also collect Microsoft Entra ID (Graph) directory objects (off by default).")
+                   help="Also collect Microsoft Entra ID directory PRINCIPALS via Graph: users, "
+                        "groups (+ memberships), service principals, app registrations, directory "
+                        "role assignments and PIM. This is personal / principal-identifying data "
+                        "and is OFF by default. Non-personal tenant CONFIGURATION is collected by "
+                        "default (see --no-entra-tenant).")
+    p.add_argument("--no-entra-tenant", action="store_true",
+                   help="Skip the default Microsoft Entra ID tenant CONFIGURATION collection "
+                        "(organization, domains, authorization/consent/auth-method/cross-tenant "
+                        "policies, directory settings, licenses, role definitions, Conditional "
+                        "Access, named locations). This tier contains no personal profile data.")
     p.add_argument("--no-group-members", action="store_true",
                    help="With --include-entra, skip group membership expansion (the heaviest Graph step).")
     p.add_argument("--no-diagnostics", action="store_true",
@@ -1550,6 +1637,9 @@ def parse_args(argv):
     p.add_argument("--no-budgets", action="store_true", help="Skip consumption budgets.")
     p.add_argument("--no-policy-compliance", action="store_true",
                    help="Skip Policy compliance summary.")
+    p.add_argument("--no-defender-settings", action="store_true",
+                   help="Skip Microsoft Defender for Cloud settings collected via REST "
+                        "(plans/pricings, auto-provisioning, settings, workspace settings).")
     p.add_argument("--include-keyvault-metadata", action="store_true",
                    help="Also list Key Vault object metadata (names/expiry, NO values; "
                         "needs 'Key Vault Reader' data-plane access).")

@@ -97,13 +97,24 @@ python3 -m pip install -r requirements.txt
   config/slots/settings, Key Vault object metadata)
 - **Diagnostic settings** for every resource
 - **Resource locks**, **management-group hierarchy**, **provider registrations**,
-  **budgets**, and a **Policy compliance summary**
+  **budgets**, a **Policy compliance summary**, and **Microsoft Defender for Cloud settings**
+  (plans/pricings, auto-provisioning, settings, workspace) — configuration the
+  `securityresources` graph table does not expose. Skip with `--no-defender-settings`
 
-**Layer 3 — Microsoft Entra ID (Microsoft Graph)** — *opt-in with `--include-entra` (off by default)*
-- Organization, domains, users, groups (+ memberships), service principals, application
-  registrations, directory roles, administrative units, OAuth2 permission grants,
-  directory role definitions/assignments, **PIM** eligible/active assignments,
-  **Conditional Access** policies, and named locations
+**Layer 3 — Microsoft Entra ID (Microsoft Graph)** — split into two tiers so the **default run
+collects no personal data**:
+
+- **Tenant configuration** *(on by default; no personal data)* — organization, verified
+  domains, authorization / authentication-methods / admin-consent / permission-grant /
+  cross-tenant-access policies, security defaults, directory settings, subscribed licenses
+  (SKUs), directory role **definitions** and templates, **Conditional Access** policies and
+  named locations. This tier holds only tenant-wide configuration (Conditional Access may
+  reference opaque principal object-IDs, but never names, emails or memberships). Skip it with
+  `--no-entra-tenant`.
+- **Directory principals** *(opt-in with `--include-entra`; personal data)* — users, groups
+  (+ memberships), service principals, application registrations, directory roles,
+  administrative units, OAuth2 permission grants, directory role **assignments**, and **PIM**
+  eligible/active assignments. Off by default.
 
 If a Graph permission is missing, that collector is skipped with a warning (the run continues).
 
@@ -114,8 +125,9 @@ If a Graph permission is missing, that collector is skipped with a warning (the 
 | Purpose | Least-privilege role |
 | --- | --- |
 | Resources, config, RBAC, Policy, exhaustive GET | **Reader** at the tenant root management group (or per subscription) |
-| Defender for Cloud data | **Security Reader** |
-| Microsoft Entra ID (Layer 3, opt-in `--include-entra`) | Microsoft Graph **Directory.Read.All** (plus **Policy.Read.All** and **RoleManagement.Read.Directory** for Conditional Access / PIM) |
+| Defender for Cloud data & settings | **Security Reader** (or **Reader**) |
+| Microsoft Entra ID tenant config (Layer 3, on by default) | Microsoft Graph **Directory.Read.All** + **Policy.Read.All** (read-only; no personal data). Missing permissions are skipped with a warning |
+| Microsoft Entra ID directory principals (opt-in `--include-entra`) | Additionally **RoleManagement.Read.Directory** for directory role assignments / PIM |
 | Key Vault object metadata (opt-in, `--include-keyvault-metadata`) | **Key Vault Reader** (data-plane; names/expiry only, never values) |
 | Upload destination | A **container SAS** with `Create`, `Write`, `Add` (and `List`) permissions |
 
@@ -261,7 +273,9 @@ Run `python3 azsnapshot.py --help` for the full list. Frequently used:
 | `--arg-concurrency` | Max concurrent Resource Graph requests (default 4; protects the ARG quota) |
 | `--max-resource-detail` | Cap Stage 2 per-resource GETs (0 = unlimited); useful for very large tenants |
 | `--work-dir` + `--resume` | Stable working dir + continue a prior run |
-| `--include-entra` / `--no-group-members` | Collect Entra ID (off by default) / skip group membership expansion |
+| `--no-entra-tenant` | Skip the default Entra ID tenant configuration collection (no personal data) |
+| `--include-entra` / `--no-group-members` | Also collect Entra ID directory principals — users, groups, PIM (off by default) / skip group membership expansion |
+| `--no-defender-settings` | Skip Microsoft Defender for Cloud settings (plans, auto-provisioning, workspace) |
 | `--no-diagnostics` / `--no-children` | Skip diagnostic settings / child sub-resources |
 | `--include-keyvault-metadata` | Add Key Vault object metadata (names/expiry, no values) |
 | `--cloud` | `AzureCloud` (default), `AzureUSGovernment`, `AzureChinaCloud` |
