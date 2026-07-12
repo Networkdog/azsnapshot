@@ -278,12 +278,224 @@ REDACTED = "[REDACTED]"
 # --------------------------------------------------------------------------------------
 requests = None  # type: ignore  # set by _late_imports()
 _QUIET = False
+_PROGRESS = None  # type: ignore  # the active ProgressBar during a run (see Snapshotter.run)
+
+
+class ProgressBar:
+    """Lightweight, dependency-free progress reporter for the collection process.
+
+    On an interactive terminal (stderr is a TTY) it renders a single-line progress bar
+    with a live percentage that updates in place; determinate phases (e.g. Stage 2
+    per-resource detail) show ``[####----] 42.0%  4200/10000`` while discovery-style
+    phases with no known total show an animated spinner plus a running count. When stderr
+    is not a TTY (pipes, Azure Cloud Shell / ACI log capture) it degrades to a throttled
+    one-line status printed every ``HEARTBEAT_SECONDS`` so captured logs stay readable.
+
+    Every stderr write during a run funnels through this object's lock, so ordinary log
+    lines and the in-place bar never collide. All methods are thread-safe and become
+    no-ops when disabled (``--quiet``).
+    """
+
+    _SPINNER = "|/-\\"
+    _WIDTH = 24
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.is_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+        self.lock = threading.RLock()
+        enc = (getattr(sys.stderr, "encoding", None) or "").lower()
+        unicode_ok = "utf" in enc
+        self._fill = "\u2588" if unicode_ok else "#"   # full block
+        self._empty = "\u2591" if unicode_ok else "-"  # light shade
+        self._label = ""
+        self._current = 0
+        self._total = 0
+        self._determinate = False
+        self._active = False
+        self._started = time.time()
+        self._spin = 0
+        self._last_len = 0
+        self._last_draw = 0.0
+        self._last_log = 0.0
+
+    # -- lifecycle ----------------------------------------------------------------------
+    def start_run(self, started: float) -> None:
+        """Anchor the elapsed-time clock to the overall run start."""
+        self._started = started
+
+    def start(self, label: str, total: int = 0) -> None:
+        """Begin a phase. total > 0 makes it determinate (bar + %); else indeterminate."""
+        if not self.enabled:
+            return
+        with self.lock:
+            self._label = label
+            self._current = 0
+            self._total = max(0, int(total))
+            self._determinate = self._total > 0
+            self._active = True
+            self._last_log = time.time()
+            if self.is_tty:
+                self._draw_locked(force=True)
+
+    def advance(self, n: int = 1) -> None:
+        if not self.enabled or not self._active or n == 0:
+            return
+        with self.lock:
+            self._current += n
+            self._render_locked()
+
+    def set_current(self, value: int) -> None:
+        if not self.enabled or not self._active:
+            return
+        with self.lock:
+            self._current = max(0, int(value))
+            self._render_locked()
+
+    def tick(self) -> None:
+        """Periodic pulse from the render thread: animate (TTY) or heartbeat (non-TTY)."""
+        if not self.enabled or not self._active:
+            return
+        with self.lock:
+            if self.is_tty:
+                self._spin = (self._spin + 1) % len(self._SPINNER)
+                self._draw_locked()
+            else:
+                self._log_status_locked()
+
+    def finish(self) -> None:
+        """Complete the current phase (fill the bar to 100% and end the line on a TTY)."""
+        if not self.enabled:
+            return
+        with self.lock:
+            if not self._active:
+                return
+            self._active = False
+            if self.is_tty:
+                if self._determinate:
+                    self._current = self._total
+                self._draw_locked(force=True)
+                try:
+                    sys.stderr.write("\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                self._last_len = 0
+
+    def close(self) -> None:
+        """Erase any lingering bar at end of run."""
+        if not self.enabled:
+            return
+        with self.lock:
+            self._active = False
+            if self.is_tty and self._last_len:
+                try:
+                    sys.stderr.write("\r" + " " * self._last_len + "\r")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                self._last_len = 0
+
+    # -- coordination with log() --------------------------------------------------------
+    def write_line(self, line: str) -> None:
+        """Emit a full log line without corrupting an on-screen bar (TTY-safe)."""
+        with self.lock:
+            try:
+                if self.is_tty and self._last_len:
+                    sys.stderr.write("\r" + " " * self._last_len + "\r")
+                self._last_len = 0
+                sys.stderr.write(line)
+                sys.stderr.flush()
+                if self.is_tty and self.enabled and self._active:
+                    self._draw_locked(force=True)
+            except Exception:
+                try:
+                    sys.stderr.write(line)
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+
+    # -- internal rendering -------------------------------------------------------------
+    def _render_locked(self) -> None:
+        if self.is_tty:
+            self._draw_locked()
+        else:
+            self._log_status_locked()
+
+    def _bar_text(self) -> str:
+        elapsed = int(time.time() - self._started)
+        if self._determinate:
+            total = self._total or 1
+            frac = self._current / total
+            if frac > 1.0:
+                frac = 1.0
+            filled = int(round(frac * self._WIDTH))
+            bar = self._fill * filled + self._empty * (self._WIDTH - filled)
+            return (f"{self._label} [{bar}] {frac * 100:5.1f}%  "
+                    f"{self._current}/{self._total}  ({elapsed}s)")
+        spin = self._SPINNER[self._spin]
+        count = f"  {self._current}" if self._current else ""
+        return f"{self._label} {spin}{count}  ({elapsed}s)"
+
+    def _draw_locked(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and (now - self._last_draw) < 0.08:
+            return
+        self._last_draw = now
+        try:
+            text = self._bar_text()
+            try:
+                cols = os.get_terminal_size(sys.stderr.fileno()).columns
+            except Exception:
+                cols = 80
+            if cols and len(text) > cols - 1:
+                text = text[:cols - 1]
+            pad = max(0, self._last_len - len(text))
+            sys.stderr.write("\r" + text + " " * pad)
+            sys.stderr.flush()
+            self._last_len = len(text)
+        except Exception:
+            # Never let terminal rendering break the actual snapshot; drop to log-only.
+            self.enabled = False
+
+    def _log_status_locked(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and (now - self._last_log) < HEARTBEAT_SECONDS:
+            return
+        self._last_log = now
+        elapsed = int(now - self._started)
+        if self._determinate:
+            total = self._total or 1
+            pct = min(100.0, self._current / total * 100)
+            msg = (f"{self._label}: {self._current}/{self._total} "
+                   f"({pct:.1f}%) - {elapsed}s elapsed")
+        else:
+            count = f" {self._current}" if self._current else ""
+            msg = f"...{self._label}{count} ({elapsed}s elapsed)"
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        try:
+            sys.stderr.write(f"[{ts}] {msg}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+
+def _set_progress(pb) -> None:
+    global _PROGRESS
+    _PROGRESS = pb
 
 
 def log(msg: str) -> None:
-    if not _QUIET:
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        sys.stderr.write(f"[{ts}] {msg}\n")
+    if _QUIET:
+        return
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    pb = _PROGRESS
+    if pb is not None:
+        # Route through the active bar so a log line never collides with the in-place
+        # progress bar being drawn on the same TTY line.
+        pb.write_line(line)
+    else:
+        sys.stderr.write(line)
         sys.stderr.flush()
 
 
@@ -568,7 +780,7 @@ class Snapshotter:
         self._done_ids = set()      # for --resume (Stage 2 resource detail)
         self._done_diag = set()     # for --resume (diagnostics)
         self._hb_stop = threading.Event()
-        self._progress = {"resource_detail": 0, "resource_total": 0}
+        self.progress = ProgressBar(enabled=not args.quiet)
 
     # -- error/warn helpers -------------------------------------------------------------
     def error(self, stage: str, target: str, message: str) -> None:
@@ -726,7 +938,9 @@ class Snapshotter:
                     if len(batch) >= 500:
                         count += self.writer.write_many("resources", batch)
                         batch = []
+                        self.progress.set_current(count)
                 count += self.writer.write_many("resources", batch)
+                self.progress.set_current(count)
         except Exception as exc:
             self.error("arg", "resources", exc)
         self.resource_count = count
@@ -777,8 +991,8 @@ class Snapshotter:
     # -- Stage 2: exhaustive per-resource detail via ARM $batch -------------------------
     def collect_resource_details(self) -> None:
         total = self.resource_count
-        self._progress["resource_total"] = total
-        self._progress["resource_detail"] = len(self._done_ids)
+        self.progress.start("Stage 2: resource detail", total)
+        self.progress.set_current(len(self._done_ids))
         if total >= LARGE_TENANT_WARN:
             log(f"NOTE: {total} resources - Stage 2 (full per-resource GET) is very large. "
                 f"Consider --resource-detail arg-only, --subscription/--management-group scoping, "
@@ -823,9 +1037,10 @@ class Snapshotter:
                     out.append({"id": rid, "type": rtype, "status": status,
                                 "error": _short_error(content)})
             self.writer.write_many("resource_detail", out)
-            self._progress["resource_detail"] += len(items)
+            self.progress.advance(len(items))
 
         self._stream_chunks(gen(), self.args.batch_size, do_batch, stage="resource_detail")
+        self.progress.finish()
 
         if not self.args.no_children:
             self.collect_children()
@@ -859,13 +1074,18 @@ class Snapshotter:
                             item = _blank_setting_values(item)
                         self.writer.write("resource_children",
                                           {"parentId": rid, "childType": rel, "child": item})
+            self.progress.advance(len(entries))
 
         log("Stage 2: enumerating child sub-resources")
+        self.progress.start("Stage 2: child sub-resources")
         self._stream_chunks(gen(), 8, do_chunk, stage="children")
+        self.progress.finish()
 
     # -- Stage 2: diagnostic settings ---------------------------------------------------
     def collect_diagnostics(self) -> None:
         log("Stage 2: diagnostic settings")
+        self.progress.start("Stage 2: diagnostic settings", self.resource_count)
+        self.progress.set_current(len(self._done_diag))
 
         def gen():
             for rid, rtype, _n, _l in self._iter_worklist():
@@ -896,8 +1116,10 @@ class Snapshotter:
                         out.append({"id": rid, "diagnosticSettings": settings})
             if out:
                 self.writer.write_many("diagnostic_settings", out)
+            self.progress.advance(len(items))
 
         self._stream_chunks(gen(), self.args.batch_size, do_batch, stage="diagnostics")
+        self.progress.finish()
 
     # -- ARM $batch --------------------------------------------------------------------
     def _arm_batch(self, reqs):
@@ -1038,6 +1260,7 @@ class Snapshotter:
         if not vaults:
             return
         log(f"Key Vault metadata: {len(vaults)} vault(s)")
+        self.progress.start("Stage 2: Key Vault metadata", len(vaults))
         suffix = self.cloud["kv_suffix"]
 
         def one(entry):
@@ -1057,7 +1280,9 @@ class Snapshotter:
                         url = data.get("nextLink")
                 except Exception as exc:
                     self.warn("keyvault", f"{name}/{kind}", exc)
+            self.progress.advance(1)
         self._map(one, vaults, stage="keyvault")
+        self.progress.finish()
 
     # -- Microsoft Entra ID via Graph ---------------------------------------------------
     def entra_enabled(self) -> bool:
@@ -1222,13 +1447,12 @@ class Snapshotter:
         drain(0)
 
     # -- heartbeat ----------------------------------------------------------------------
-    def _heartbeat(self, started):
-        while not self._hb_stop.wait(HEARTBEAT_SECONDS):
-            elapsed = int(time.time() - started)
-            done = self._progress["resource_detail"]
-            total = self._progress["resource_total"]
-            extra = f" | resource detail {done}/{total}" if total else ""
-            log(f"...working ({elapsed}s elapsed){extra}")
+    def _progress_loop(self):
+        # Animate the in-place bar on a TTY (~5x/sec); on non-TTY stderr the bar's own
+        # tick() emits a throttled one-line status every HEARTBEAT_SECONDS instead.
+        interval = 0.2 if self.progress.is_tty else 1.0
+        while not self._hb_stop.wait(interval):
+            self.progress.tick()
 
     # -- resume support -----------------------------------------------------------------
     def load_resume_state(self):
@@ -1241,7 +1465,9 @@ class Snapshotter:
     # -- orchestration ------------------------------------------------------------------
     def run(self):
         started = time.time()
-        hb = threading.Thread(target=self._heartbeat, args=(started,), daemon=True)
+        self.progress.start_run(started)
+        _set_progress(self.progress)
+        hb = threading.Thread(target=self._progress_loop, daemon=True)
         hb.start()
         try:
             self.discover()
@@ -1254,6 +1480,7 @@ class Snapshotter:
             # which avoids nested submission / deadlock even at --concurrency 1.
             log("Stage 1: discovery (ARG + governance%s) in parallel"
                 % (" + Entra" if self.entra_enabled() else ""))
+            self.progress.start("Stage 1: discovery")
 
             def _resources():
                 try:
@@ -1281,6 +1508,7 @@ class Snapshotter:
             res_thread.join()
             if entra_thread:
                 entra_thread.join()
+            self.progress.finish()
             log(f"Stage 1 complete: {self.resource_count} resources discovered")
 
             # Stage 2: exhaustive per-resource detail (+ children, diagnostics, KV metadata).
@@ -1300,6 +1528,9 @@ class Snapshotter:
             self.error("run", "-", exc)
         finally:
             self._hb_stop.set()
+            hb.join(timeout=2)
+            self.progress.close()
+            _set_progress(None)
             self.writer.close()
             self.executor.shutdown(wait=True)
         return self.finalize(started)
@@ -1711,7 +1942,8 @@ def main(argv=None):
     if args.work_dir:
         workdir = args.work_dir
     elif args.resume:
-        workdir = os.path.join(args.out, ".azsnapshot-work")
+        workdir = _default_resume_workdir()
+        log(f"Resume working directory: {workdir}")
     else:
         workdir = tempfile.mkdtemp(prefix="azsnapshot-")
     os.makedirs(workdir, exist_ok=True)
@@ -1743,6 +1975,17 @@ def main(argv=None):
     if not args.keep_temp and not args.work_dir and not args.resume:
         _clear_dir(workdir, remove_root=True)
     return 0  # per-item errors are recorded in the manifest; the run itself succeeded
+
+
+def _default_resume_workdir():
+    """Stable, persistent working directory for --resume, chosen automatically so the exact
+    same one-liner resumes regardless of the current directory. Prefers the Cloud Shell
+    ~/clouddrive mount when it exists, otherwise the home directory (both persist on a
+    storage-backed Cloud Shell)."""
+    home = os.path.expanduser("~")
+    clouddrive = os.path.join(home, "clouddrive")
+    base = clouddrive if os.path.isdir(clouddrive) else home
+    return os.path.join(base, ".azsnapshot-work")
 
 
 def _clear_dir(path, remove_root=False):

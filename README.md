@@ -180,13 +180,14 @@ Cloud Shell has a **~20-minute idle timeout** and then **recycles the container*
 `nohup`/background jobs do not survive. For large tenants:
 
 1. **Use `--resume` (most reliable).** Output is written to disk immediately as NDJSON, so a
-   killed run can be continued. The one-liner below uses `~/clouddrive` when it exists and
-   otherwise falls back to your home directory, so it also runs on a **no-storage (ephemeral)**
-   Cloud Shell:
+   killed run can be continued. With `--resume` the tool automatically keeps its working
+   directory in a persistent location (`~/clouddrive` when present, otherwise your home
+   directory), so you can pipe the script straight from GitHub — no download, no `--work-dir`,
+   and no `--sas-url` when `AZSNAP_SAS_URL` is set:
 
    ```bash
-   # One line — works with or without ~/clouddrive. Re-run the same line to resume.
-   DIR=~/clouddrive; [ -d "$DIR" ] || DIR="$HOME"; curl -sL https://raw.githubusercontent.com/Networkdog/azsnapshot/main/azsnapshot.py -o "$DIR/azsnapshot.py" && python3 "$DIR/azsnapshot.py" --sas-url "$AZSNAP_SAS_URL" --work-dir "$DIR/azsnap-work" --resume --keep-temp
+   # One line — re-run the exact same line to resume. Reads the SAS from AZSNAP_SAS_URL.
+   curl -sL https://raw.githubusercontent.com/Networkdog/azsnapshot/main/azsnapshot.py | python3 - --resume
    ```
 
    Re-run the exact same one-liner if the session drops — it skips already-collected resource
@@ -200,8 +201,10 @@ Cloud Shell has a **~20-minute idle timeout** and then **recycles the container*
    and disable the heaviest step with `--no-diagnostics`. Use `--resource-detail arg-only` to
    skip the exhaustive Stage 2 entirely for a fast inventory.
 
-3. **Keep the session active** with `tmux` (available in Cloud Shell). The tool also prints a
-   heartbeat every ~60s.
+3. **Keep the session active** with `tmux` (available in Cloud Shell). On an interactive
+   terminal the tool shows a live progress bar with a percentage for each phase; when output
+   is piped or captured (Cloud Shell logs, ACI) it instead prints a status line with the
+   percentage every ~60s. Use `--quiet` to suppress it entirely.
 
 4. **For big or recurring snapshots, run it unattended** and skip Cloud Shell altogether —
    see below.
